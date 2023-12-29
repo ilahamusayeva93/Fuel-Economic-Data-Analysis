@@ -1,0 +1,248 @@
+---
+title: "Fuel Economy Data Analysis"
+author: "Ilaha Musayeva"
+date: "10.25.2023"
+---
+
+## Data Exploration
+
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(data.table)
+library(skimr)
+library(rstudioapi)
+library(inspectdf)
+library(mice)
+library(plotly)
+library(highcharter)
+library(recipes)
+library(caret)
+library(purrr)
+library(graphics) 
+library(Hmisc)
+library(glue)
+library(h2o)
+
+
+
+# Load dataset (mpg from ggplot2)
+data <- ggplot2::mpg
+
+# Explore data using skimr and inspect_na
+data %>% skim()
+data %>% inspect_na()
+
+# Identify numeric variables
+names(data)
+num_vars <- data %>%
+  select_if(is.numeric) %>%
+  names()
+num_vars
+
+# Identify and handle outliers using boxplots
+for (b in num_vars) {
+  OutVals <- boxplot(data[[b]])$out
+  if (length(OutVals) > 0) {
+    print(paste0("----", b))
+    print(OutVals)
+  }
+}
+
+# Replace outliers in 'cty' variable with quartile values
+OutVals <- boxplot(data[["cty"]])$out
+median <- median(data[["cty"]])
+
+o3 <- ifelse(OutVals > median, OutVals, NA) %>% na.omit() %>% as.matrix() %>% t() %>% .[1,]
+o1 <- ifelse(OutVals < median, OutVals, NA) %>% na.omit() %>% as.matrix() %>% t() %>% .[1,]
+
+data <- na.omit(data)
+
+val75 <- quantile(data[["cty"]], 0.75)
+val25 <- quantile(data[["cty"]], 0.25)
+
+data[which(data[["cty"]] %in% o3), "cty"] <- val75
+data[which(data[["cty"]] %in% o1), "cty"] <- val25
+boxplot(data[["cty"]])
+
+# Prepare data for modeling
+names(data)
+target <- "cty"
+features <- data %>% select(c("year", "cyl", "displ"))
+```
+
+## Modeling
+
+```{r}
+# Build and refine a linear regression model using H2O
+f <- as.formula(paste(target, paste(features, collapse = " + "), sep = " ~ "))
+glm <- glm(f, data = data)
+glm %>% summary()
+
+# Check and handle multicollinearity using VIF
+library(faraway)
+while (glm %>% faraway::vif() %>% sort(decreasing = TRUE) %>% .[1] >= 1.5) {
+  afterVIF <- glm %>% faraway::vif() %>% sort(decreasing = TRUE) %>% .[-1] %>% names()
+  f <- as.formula(paste(target, paste(afterVIF, collapse = " + "), sep = " ~ "))
+  glm <- glm(f, data = data)
+}
+
+# Display final VIF results
+glm %>% faraway::vif() %>% sort(decreasing = TRUE) %>% names() -> features
+
+# Prepare data for modeling
+data <- data %>%
+  select(cty, year, cyl, displ) %>%
+  glimpse()
+
+# Standardize predictor variables
+data[, -1] <- data[, -1] %>% scale() %>% as.data.frame()
+
+# Initialize H2O
+h2o.init()
+
+# Convert data to H2O frame
+h2o_data <- data %>% as.h2o()
+h2o_data <- h2o_data %>% h2o.splitFrame(ratios = 0.8, seed = 123)
+
+# Define target and features
+target <- "cty"
+features <- data %>% select(c("year", "cyl", "displ")) %>% names()
+
+# Split data into training and testing sets
+train <- h2o_data[[1]]
+test <- h2o_data[[2]]
+
+# Build H2O GLM model
+model <- h2o.glm(
+  x = features, y = target,
+  training_frame = train,
+  validation_frame = test,
+  seed = 123, nfolds = 10,
+  lambda = 0,
+  compute_p_values = TRUE
+)
+
+# Display model summary
+summary(model)
+
+# Display coefficients with p-values
+model@model$coefficients_table %>%
+  as.data.frame() %>%
+  dplyr::select(names, p_value) %>%
+  mutate(p_value = round(p_value, 3)) %>%
+  .[-1,] %>%
+  arrange(desc(p_value))
+```
+## Evaluation
+```{r}
+# Make predictions on the test set
+y_pred <- model %>% h2o.predict(newdata = test) %>% as.data.frame() 
+y_pred$predict
+
+# Evaluate model performance on the test set
+test_set <- test %>% as.data.frame()
+residuals <- test_set$cty - y_pred$predict
+RMSE = sqrt(mean(residuals^2))
+
+# Calculate R-squared and Adjusted R-squared
+y_test_mean = mean(test_set$cty)
+tss = sum((test_set$cty - y_test_mean)^2) 
+rss = sum(residuals^2)
+R2 = 1 - (rss/tss)
+n <- test_set %>% nrow() 
+k <- features %>% length() 
+Adjusted_R2 = 1 - (1 - R2) * ((n - 1) / (n - k - 1))
+
+# Display evaluation metrics
+tibble(RMSE = round(RMSE, 1),
+       R2, Adjusted_R2)
+
+# Create a dataframe for observed and predicted values
+my_data <- cbind(predicted = y_pred$predict,
+                 observed = test_set$cty) %>%
+  as.data.frame()
+
+# Visualize the results using ggplot
+g <- my_data %>%
+  ggplot(aes(predicted, observed)) +
+  geom_point(color = "red") +
+  geom_smooth(method = lm) + 
+  labs(x = "Predicted Power Output", 
+       y = "Observed Power Output",
+       title = glue('Test: Adjusted R2 = {round(enexpr(Adjusted_R2), 2)}')) +
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12), 
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 14), 
+        axis.title.y = element_text(size = 14))
+
+# Convert ggplot to plotly for interactive visualization
+g %>% ggplotly()
+
+# Make predictions on the training set
+y_pred_train <- model %>% h2o.predict(newdata = train) %>% as.data.frame()
+
+# Evaluate model performance on the training set
+train_set <- train %>% as.data.frame()
+residuals_train <- train_set$cty - y_pred_train$predict
+RMSE_train = sqrt(mean(residuals_train^2))
+y_train_mean = mean(train_set$cty)
+
+# Calculate R-squared and Adjusted R-squared for training set
+tss_train = sum((train_set$cty - y_train_mean)^2)
+rss_train = sum(residuals_train^2)
+R2_train = 1 - (rss_train/tss_train)
+n_train <- train_set %>% nrow()
+k_train <- features %>% length()  
+Adjusted_R2_train = 1 - (1 - R2_train) * ((n_train - 1) / (n_train - k_train - 1))
+
+# Create a dataframe for observed and predicted values on the training set
+my_data_train <- cbind(predicted = y_pred_train$predict,
+                       observed = train_set$cty) %>% 
+  as.data.frame()
+
+# Visualize the results on the training set using ggplot
+g_train <- my_data_train %>% 
+  ggplot(aes(predicted, observed)) + 
+  geom_point(color = "darkred") + 
+  geom_smooth(method = lm) + 
+  labs(x = "Predicted Power Output", 
+       y = "Observed Power Output",
+       title = glue('Train: Adjusted R2 = {round(enexpr(Adjusted_R2_train), 2)}')) +
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12), 
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 14), 
+        axis.title.y = element_text(size = 14))
+
+# Convert ggplot to plotly for interactive visualization
+g_train %>% ggplotly()
+
+# Display results for both training and test sets
+library(patchwork)
+g_train + g
+
+# Display final evaluation metrics
+tibble(RMSE_train = round(RMSE_train, 1),
+       RMSE_test = round(RMSE, 1),
+       Adjusted_R2_train,
+       Adjusted_R2_test = Adjusted_R2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
