@@ -48,6 +48,4 @@ To replicate the analysis:
 - **Ilaha Musayeva**
 - **Date: 10.25.2023**
 
-## License
 
-This project is licensed under the [MIT License](LICENSE).
